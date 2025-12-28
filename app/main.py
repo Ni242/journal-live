@@ -2,10 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 # IMPORT ROUTERS
-from app.routes.positions import router as positions_router
-from app.routes.pnl import router as pnl_router
-from app.routes.capital import router as capital_router
-from app.routes.risk import router as risk_router
+from app.routes.positions_routes import router as positions_router
+from app.routes.pnl_routes import router as pnl_router
+from app.routes.capital_routes import router as capital_router
+from app.routes.risk_routes import router as risk_router
+
 
 app = FastAPI(
     title="Trading Journal API",

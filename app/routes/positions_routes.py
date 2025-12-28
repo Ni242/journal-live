@@ -4,11 +4,14 @@ from sqlalchemy import select
 from collections import defaultdict
 from decimal import Decimal
 
-from ..deps import get_db
-from ..models import Trade
-from ..services.pnl_engine import get_lot_size
+from app.deps import get_db
+from app.models import Trade
+from app.services.pnl_engine import get_lot_size
 
-router = APIRouter(prefix="/positions", tags=["positions"])
+router = APIRouter(
+    prefix="/positions",
+    tags=["Positions"]
+)
 
 
 @router.get("/")
@@ -18,12 +21,12 @@ async def get_realized_positions(db: AsyncSession = Depends(get_db)):
     )
     trades = result.scalars().all()
 
-    pos = defaultdict(lambda: {
-        "buy_qty": Decimal(0),
-        "sell_qty": Decimal(0),
-        "buy_value": Decimal(0),
-        "sell_value": Decimal(0),
-        "lot_size": Decimal(1),
+    positions = defaultdict(lambda: {
+        "buy_qty": Decimal("0"),
+        "sell_qty": Decimal("0"),
+        "buy_value": Decimal("0"),
+        "sell_value": Decimal("0"),
+        "lot_size": Decimal("1"),
     })
 
     # ----------------------------
@@ -35,10 +38,9 @@ async def get_realized_positions(db: AsyncSession = Depends(get_db)):
 
         qty = Decimal(t.quantity or 0)
         price = Decimal(t.price or 0)
-        lot_size = get_lot_size(t.symbol)
 
-        p = pos[t.symbol]
-        p["lot_size"] = lot_size
+        p = positions[t.symbol]
+        p["lot_size"] = Decimal(get_lot_size(t.symbol))
 
         if t.side.upper() == "BUY":
             p["buy_qty"] += qty
@@ -53,28 +55,22 @@ async def get_realized_positions(db: AsyncSession = Depends(get_db)):
     # ----------------------------
     # REALIZED POSITIONS ONLY
     # ----------------------------
-    for symbol, p in pos.items():
-        net_qty = p["buy_qty"] - p["sell_qty"]
+    for symbol, p in positions.items():
+        realized_qty = min(p["buy_qty"], p["sell_qty"])
 
-        if net_qty != 0:
-            continue  # skip open positions
-
-        if p["buy_qty"] == 0 or p["sell_qty"] == 0:
+        if realized_qty <= 0:
             continue
-
-        lots = min(p["buy_qty"], p["sell_qty"])
 
         avg_buy = p["buy_value"] / p["buy_qty"]
         avg_sell = p["sell_value"] / p["sell_qty"]
 
         pnl_points = avg_sell - avg_buy
-        pnl_amount = pnl_points * p["lot_size"] * lots
+        pnl_amount = pnl_points * realized_qty * p["lot_size"]
 
         output.append({
             "symbol": symbol,
             "net_qty": 0,
-            "lots": int(lots),
-            "lot_size": int(p["lot_size"]),
+            "realized_qty": float(realized_qty),
             "avg_price": float(round(avg_buy, 2)),
             "realized_pnl_points": float(round(pnl_points, 2)),
             "realized_pnl_amount": float(round(pnl_amount, 2)),
