@@ -4,12 +4,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy import text
 
 # =========================
-# DATABASE URL
+# DATABASE URL (REQUIRED)
 # =========================
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "sqlite+aiosqlite:///./trading_journal.db"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable is not set")
 
 # =========================
 # ASYNC ENGINE
@@ -17,8 +17,7 @@ DATABASE_URL = os.getenv(
 engine = create_async_engine(
     DATABASE_URL,
     echo=False,
-    future=True,
-    pool_pre_ping=True,   # avoids stale connections
+    pool_pre_ping=True,
 )
 
 # =========================
@@ -35,8 +34,9 @@ AsyncSessionLocal = sessionmaker(
 # =========================
 async def get_db():
     async with AsyncSessionLocal() as session:
-        # SQLite stability settings (safe for Postgres too)
+        # SQLite-only pragmas (safe guard)
         if DATABASE_URL.startswith("sqlite"):
             await session.execute(text("PRAGMA journal_mode=WAL;"))
             await session.execute(text("PRAGMA foreign_keys=ON;"))
+
         yield session
