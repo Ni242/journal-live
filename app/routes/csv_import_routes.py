@@ -136,7 +136,10 @@ async def import_csv_trades(
 
         # ---------- Load raw file ----------
         if file.filename.lower().endswith(".csv"):
-            raw_df = pd.read_csv(io.BytesIO(data), header=None)
+            try:
+                raw_df = pd.read_csv(io.BytesIO(data), header=None, encoding="utf-8")
+            except UnicodeDecodeError:
+                raw_df = pd.read_csv(io.BytesIO(data), header=None, encoding="latin1")
         else:
             raw_df = pd.read_excel(io.BytesIO(data), header=None)
 
@@ -156,7 +159,10 @@ async def import_csv_trades(
             raise HTTPException(400, "Could not detect CSV header row")
 
         if file.filename.lower().endswith(".csv"):
-            table = pd.read_csv(io.BytesIO(data), header=header_idx)
+            try:
+                table = pd.read_csv(io.BytesIO(data), header=header_idx, encoding="utf-8")
+            except UnicodeDecodeError:
+                table = pd.read_csv(io.BytesIO(data), header=header_idx, encoding="latin1")
         else:
             table = pd.read_excel(io.BytesIO(data), header=header_idx)
 
