@@ -8,6 +8,8 @@ from app.routes.positions_routes import router as positions_router
 from app.routes.pnl_routes import router as pnl_router
 from app.routes.capital_routes import router as capital_router
 from app.routes.risk_routes import router as risk_router
+from app.routes.csv_import_routes import router as csv_import_router
+
 
 app = FastAPI(title="Trading Journal API")
 
@@ -28,6 +30,8 @@ app.include_router(positions_router)
 app.include_router(pnl_router)
 app.include_router(capital_router)
 app.include_router(risk_router)
+app.include_router(csv_import_router)
+
 
 @app.get("/")
 def root():
