@@ -41,7 +41,7 @@ def safe_float(val, default=0.0) -> float:
 
 def extract_date_from_header(df: pd.DataFrame) -> Optional[str]:
     pattern = re.compile(r"(\d{1,2}-\d{1,2}-\d{4})")
-    for i in range(min(20, len(df))):
+    for i in range(min(30, len(df))):
         for cell in df.iloc[i].astype(str):
             m = pattern.search(cell)
             if m:
@@ -121,7 +121,6 @@ def clean_for_json(val):
         return val.isoformat()
     return str(val)
 
-
 # ==================================================
 # CSV IMPORT ROUTE
 # ==================================================
@@ -134,35 +133,72 @@ async def import_csv_trades(
     try:
         data = await file.read()
 
-        # ---------- Load raw file ----------
+        # --------------------------------------------------
+        # READ RAW FILE (SAFE MODE)
+        # --------------------------------------------------
         if file.filename.lower().endswith(".csv"):
             try:
-                raw_df = pd.read_csv(io.BytesIO(data), header=None, encoding="utf-8")
+                raw_df = pd.read_csv(
+                    io.BytesIO(data),
+                    header=None,
+                    engine="python",
+                    sep=None,                 # AUTO detect delimiter
+                    encoding="utf-8",
+                    on_bad_lines="skip"
+                )
             except UnicodeDecodeError:
-                raw_df = pd.read_csv(io.BytesIO(data), header=None, encoding="latin1")
+                raw_df = pd.read_csv(
+                    io.BytesIO(data),
+                    header=None,
+                    engine="python",
+                    sep=None,
+                    encoding="latin1",
+                    on_bad_lines="skip"
+                )
         else:
             raw_df = pd.read_excel(io.BytesIO(data), header=None)
 
         if raw_df.empty:
             return {"inserted": 0, "fetched": 0, "preview": []}
 
-        # ---------- Sheet Date ----------
+        # --------------------------------------------------
+        # SHEET DATE
+        # --------------------------------------------------
         date_str = extract_date_from_header(raw_df)
         sheet_date = (
             datetime.strptime(date_str, "%d-%m-%Y").date()
             if date_str else datetime.utcnow().date()
         )
 
-        # ---------- Header Row ----------
+        # --------------------------------------------------
+        # HEADER ROW
+        # --------------------------------------------------
         header_idx = find_header_row_index(raw_df)
         if header_idx is None:
             raise HTTPException(400, "Could not detect CSV header row")
 
+        # --------------------------------------------------
+        # READ ACTUAL TABLE
+        # --------------------------------------------------
         if file.filename.lower().endswith(".csv"):
             try:
-                table = pd.read_csv(io.BytesIO(data), header=header_idx, encoding="utf-8")
+                table = pd.read_csv(
+                    io.BytesIO(data),
+                    header=header_idx,
+                    engine="python",
+                    sep=None,
+                    encoding="utf-8",
+                    on_bad_lines="skip"
+                )
             except UnicodeDecodeError:
-                table = pd.read_csv(io.BytesIO(data), header=header_idx, encoding="latin1")
+                table = pd.read_csv(
+                    io.BytesIO(data),
+                    header=header_idx,
+                    engine="python",
+                    sep=None,
+                    encoding="latin1",
+                    on_bad_lines="skip"
+                )
         else:
             table = pd.read_excel(io.BytesIO(data), header=header_idx)
 
@@ -172,6 +208,9 @@ async def import_csv_trades(
         fetched = 0
         preview = []
 
+        # --------------------------------------------------
+        # PROCESS ROWS
+        # --------------------------------------------------
         for _, row in table.iterrows():
             fetched += 1
 
@@ -197,7 +236,7 @@ async def import_csv_trades(
             parsed = parse_option_symbol(str(name), sheet_date)
             symbol_text = parsed["symbol_text"]
 
-            # ---------- Dedup ----------
+            # -------- Dedup --------
             q = select(Trade).where(
                 and_(
                     Trade.symbol == symbol_text,
@@ -210,7 +249,7 @@ async def import_csv_trades(
             if (await db.execute(q)).scalar_one_or_none():
                 continue
 
-            # ---------- Strategy ----------
+            # -------- Strategy --------
             temp_trade = Trade(
                 symbol=symbol_text,
                 side=side,
