@@ -59,18 +59,28 @@ def parse_side(val):
         return "SELL"
     return None
 
+def normalize(col: str) -> str:
+    return col.lower().replace(" ", "").replace("/", "")
+
 def find_dhan_header(df: pd.DataFrame) -> int:
-    """
-    Dhan header always contains these columns
-    """
-    REQUIRED = {"time", "name", "qty", "avg", "b/s"}
+    REQUIRED = {
+        "time",
+        "bs",
+        "name",
+        "qtylot",
+        "avgprice",
+    }
 
     for i in range(min(50, len(df))):
-        row = [str(x).lower() for x in df.iloc[i].tolist()]
-        if sum(any(k in cell for cell in row) for k in REQUIRED) >= 3:
+        row = [normalize(str(x)) for x in df.iloc[i].tolist()]
+        matches = sum(any(req in cell for cell in row) for req in REQUIRED)
+
+        # 🔥 If at least 3 core columns found → header row
+        if matches >= 3:
             return i
 
     raise HTTPException(400, "Dhan header row not found")
+
 
 def extract_date(df: pd.DataFrame) -> date:
     pattern = re.compile(r"(\d{1,2}-\d{1,2}-\d{4})")
