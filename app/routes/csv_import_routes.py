@@ -17,28 +17,19 @@ from typing import Optional
 
 router = APIRouter(prefix="/import/csv", tags=["csv-import"])
 
-MONTHS = {
-    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
-    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
-    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"
-}
-
 # ==================================================
-# SAFE LOADERS (MOST IMPORTANT PART)
+# SAFE LOADERS
 # ==================================================
 
 def safe_read_csv(data: bytes) -> pd.DataFrame:
-    """
-    Bulletproof CSV reader for broker files (Dhan, Zerodha, etc.)
-    """
     return pd.read_csv(
         io.BytesIO(data),
-        engine="python",           # critical
-        sep=None,                  # auto-detect delimiter
+        engine="python",
+        sep=None,
         header=None,
         encoding_errors="ignore",
-        on_bad_lines="skip",       # skip broken rows
-        quoting=3,                 # csv.QUOTE_NONE
+        on_bad_lines="skip",
+        quoting=3,
     )
 
 
@@ -48,6 +39,32 @@ def safe_read_excel(data: bytes) -> pd.DataFrame:
         header=None,
         engine="openpyxl"
     )
+
+# ==================================================
+# HEADER DETECTION (FIX)
+# ==================================================
+
+REQUIRED_COLS = {
+    "time",
+    "name",
+    "qty",
+    "quantity",
+    "avg price",
+    "price",
+    "b/s",
+    "side",
+}
+
+def find_header_row_index(df: pd.DataFrame) -> Optional[int]:
+    """
+    Find the row that looks like a trade table header
+    """
+    for i in range(min(80, len(df))):
+        row = [str(x).strip().lower() for x in df.iloc[i].tolist()]
+        hits = sum(any(req in cell for cell in row) for req in REQUIRED_COLS)
+        if hits >= 3:
+            return i
+    return None
 
 # ==================================================
 # HELPERS
@@ -65,7 +82,7 @@ def safe_float(val, default=0.0) -> float:
         return default
 
 
-def parse_qty_lot(val) -> int:
+def parse_qty(val) -> int:
     try:
         if pd.isna(val):
             return 0
@@ -86,24 +103,6 @@ def parse_side(val) -> Optional[str]:
     return None
 
 
-def extract_date_from_header(df: pd.DataFrame) -> Optional[str]:
-    pattern = re.compile(r"(\d{1,2}-\d{1,2}-\d{4})")
-    for i in range(min(30, len(df))):
-        for cell in df.iloc[i].astype(str):
-            m = pattern.search(cell)
-            if m:
-                return m.group(1)
-    return None
-
-
-def find_header_row_index(df: pd.DataFrame) -> Optional[int]:
-    for i in range(min(60, len(df))):
-        row = [str(x).lower() for x in df.iloc[i].tolist()]
-        if "time" in row and any("qty" in c for c in row):
-            return i
-    return None
-
-
 def parse_option_symbol(name: str, sheet_date: date):
     parts = str(name).split()
     underlying = parts[0] if parts else name
@@ -118,18 +117,6 @@ def parse_option_symbol(name: str, sheet_date: date):
         if p.isdigit():
             strike = int(p)
 
-    if len(parts) >= 3:
-        try:
-            day = int(parts[1])
-            mon = MONTHS.get(parts[2][:3].upper())
-            if mon:
-                expiry = datetime.strptime(
-                    f"{day:02d}-{mon}-{sheet_date.year}",
-                    "%d-%m-%Y"
-                ).date()
-        except Exception:
-            pass
-
     return {
         "symbol_text": name,
         "underlying": underlying,
@@ -139,13 +126,13 @@ def parse_option_symbol(name: str, sheet_date: date):
     }
 
 
-def clean_for_json(val):
+def clean(val):
     if isinstance(val, (datetime, date)):
         return val.isoformat()
     return str(val)
 
 # ==================================================
-# IMPORT ROUTE
+# ROUTE
 # ==================================================
 
 @router.post("/trades")
@@ -153,8 +140,8 @@ async def import_csv_trades(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db)
 ):
-    filename = file.filename.lower()
     data = await file.read()
+    filename = file.filename.lower()
 
     try:
         # ---------- RAW LOAD ----------
@@ -166,14 +153,7 @@ async def import_csv_trades(
             raise HTTPException(400, "Upload CSV or Excel file")
 
         if raw_df.empty:
-            return {"inserted": 0, "fetched": 0, "preview": []}
-
-        # ---------- DATE ----------
-        date_str = extract_date_from_header(raw_df)
-        sheet_date = (
-            datetime.strptime(date_str, "%d-%m-%Y").date()
-            if date_str else datetime.utcnow().date()
-        )
+            raise HTTPException(400, "File is empty")
 
         # ---------- HEADER ----------
         header_idx = find_header_row_index(raw_df)
@@ -197,36 +177,35 @@ async def import_csv_trades(
                 on_bad_lines="skip",
             )
 
-        table.columns = [str(c).strip() for c in table.columns]
+        table.columns = [str(c).strip().lower() for c in table.columns]
 
         inserted = 0
         fetched = 0
         preview = []
 
-        # ---------- PROCESS ----------
         for _, row in table.iterrows():
             fetched += 1
 
-            name = row.get("Name")
+            name = row.get("name")
             if pd.isna(name):
                 continue
 
-            side = parse_side(row.get("B/S"))
+            side = parse_side(row.get("b/s") or row.get("side"))
             if side is None:
                 continue
 
-            quantity = parse_qty_lot(row.get("Qty/Lot"))
-            price = safe_float(row.get("Avg Price"))
+            quantity = parse_qty(row.get("qty/lot") or row.get("qty") or row.get("quantity"))
+            price = safe_float(row.get("avg price") or row.get("price"))
 
-            trade_time = datetime.combine(sheet_date, datetime.min.time())
-            if "Time" in row and not pd.isna(row["Time"]):
+            trade_time = datetime.utcnow()
+            if "time" in row and not pd.isna(row["time"]):
                 try:
-                    t = pd.to_datetime(row["Time"])
-                    trade_time = datetime.combine(sheet_date, t.time())
+                    t = pd.to_datetime(row["time"])
+                    trade_time = t.to_pydatetime()
                 except Exception:
                     pass
 
-            parsed = parse_option_symbol(str(name), sheet_date)
+            parsed = parse_option_symbol(str(name), trade_time.date())
             symbol_text = parsed["symbol_text"]
 
             # ---------- DEDUP ----------
@@ -242,25 +221,18 @@ async def import_csv_trades(
             if (await db.execute(q)).scalar_one_or_none():
                 continue
 
-            # ---------- STRATEGY ----------
-            temp_trade = Trade(
-                symbol=symbol_text,
-                side=side,
-                quantity=quantity,
-                price=price,
-                trade_time=trade_time,
-            )
-
             strategy = detect_strategy(
-                temp_trade,
-                context={
-                    "option_type": parsed.get("option_type"),
-                    "expiry": parsed.get("expiry"),
-                }
+                Trade(
+                    symbol=symbol_text,
+                    side=side,
+                    quantity=quantity,
+                    price=price,
+                    trade_time=trade_time,
+                ),
+                context={"option_type": parsed.get("option_type")}
             )
 
             payload = {
-                "dh_order_id": None,
                 "symbol": symbol_text,
                 "side": side,
                 "quantity": quantity,
@@ -269,10 +241,8 @@ async def import_csv_trades(
                 "fees": 0,
                 "suggested_strategy": strategy["strategy"],
                 "strategy_confidence": strategy["confidence"],
-                "final_strategy": None,
                 "strategy_source": "AI",
-                "notes": None,
-                "raw": {k: clean_for_json(v) for k, v in row.items() if pd.notna(v)},
+                "raw": {k: clean(v) for k, v in row.items() if pd.notna(v)},
             }
 
             await create_trade(db, **payload)
@@ -283,13 +253,12 @@ async def import_csv_trades(
                 "side": side,
                 "qty": quantity,
                 "price": price,
-                "strategy": strategy["strategy"],
             })
 
         return {
             "inserted": inserted,
             "fetched": fetched,
-            "preview": preview[:50],
+            "preview": preview[:20],
         }
 
     except HTTPException:
