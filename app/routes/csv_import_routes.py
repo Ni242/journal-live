@@ -1,3 +1,5 @@
+# app/routes/csv_import_routes.py
+
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
@@ -10,7 +12,7 @@ from app.services.strategy_engine import detect_strategy
 import pandas as pd
 import io
 import re
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional
 
 router = APIRouter(prefix="/import/csv", tags=["csv-import"])
@@ -37,36 +39,6 @@ def safe_float(val, default=0.0) -> float:
         return default
 
 
-def extract_date_from_header(df: pd.DataFrame) -> Optional[str]:
-    """
-    Extract date from:
-    Executed Orders on 24-12-2025
-    """
-    pattern = re.compile(r"Executed\s+Orders\s+on\s+(\d{1,2}-\d{1,2}-\d{4})", re.I)
-
-    for i in range(min(40, len(df))):
-        for cell in df.iloc[i].astype(str):
-            match = pattern.search(cell)
-            if match:
-                return match.group(1)
-
-    return None
-
-
-def find_header_row_index(df: pd.DataFrame) -> Optional[int]:
-    """
-    Strict Dhan header detection
-    """
-    REQUIRED = {"time", "b/s", "name", "qty/lot", "avg price"}
-
-    for i in range(min(60, len(df))):
-        row = {str(x).strip().lower() for x in df.iloc[i].tolist()}
-        if REQUIRED.issubset(row):
-            return i
-
-    return None
-
-
 def parse_qty_lot(val) -> int:
     try:
         if pd.isna(val):
@@ -80,18 +52,34 @@ def parse_qty_lot(val) -> int:
 def parse_side(val) -> Optional[str]:
     if pd.isna(val):
         return None
-
-    v = str(val).strip().upper()
-    if v in ("B", "BUY", "B/S (B)") or "BUY" in v:
+    v = str(val).upper()
+    if "BUY" in v or v == "B":
         return "BUY"
-    if v in ("S", "SELL", "B/S (S)") or "SELL" in v:
+    if "SELL" in v or v == "S":
         return "SELL"
-
     return None
 
 
-def parse_option_symbol(name: str, sheet_date: datetime):
-    parts = name.strip().split()
+def extract_date_from_header(df: pd.DataFrame) -> Optional[str]:
+    pattern = re.compile(r"(\d{1,2}-\d{1,2}-\d{4})")
+    for i in range(min(25, len(df))):
+        for cell in df.iloc[i].astype(str):
+            m = pattern.search(cell)
+            if m:
+                return m.group(1)
+    return None
+
+
+def find_header_row_index(df: pd.DataFrame) -> Optional[int]:
+    for i in range(min(50, len(df))):
+        row = [str(x).lower() for x in df.iloc[i].tolist()]
+        if "time" in row and ("qty/lot" in row or "qty" in row):
+            return i
+    return None
+
+
+def parse_option_symbol(name: str, sheet_date: date):
+    parts = str(name).split()
     underlying = parts[0] if parts else name
 
     option_type = None
@@ -124,6 +112,12 @@ def parse_option_symbol(name: str, sheet_date: datetime):
         "option_type": option_type,
     }
 
+
+def clean_for_json(val):
+    if isinstance(val, (datetime, date)):
+        return val.isoformat()
+    return str(val)
+
 # ==================================================
 # CSV / EXCEL IMPORT ROUTE
 # ==================================================
@@ -133,42 +127,63 @@ async def import_csv_trades(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db)
 ):
-    if not file.filename.lower().endswith(".xlsx"):
+    filename = file.filename.lower()
+
+    if not (filename.endswith(".csv") or filename.endswith(".xlsx")):
         raise HTTPException(
             400,
-            "Please upload the Dhan Executed Orders Excel (.xlsx) file"
+            "Please upload a Dhan Executed Orders CSV or Excel (.xlsx) file"
         )
 
     try:
         data = await file.read()
 
-        # ---------- READ RAW EXCEL (NO CSV EVER) ----------
-        df = pd.read_excel(
-            io.BytesIO(data),
-            header=None,
-            engine="openpyxl"
-        )
+        # ---------- SAFE RAW LOAD ----------
+        if filename.endswith(".xlsx"):
+            raw_df = pd.read_excel(
+                io.BytesIO(data),
+                header=None,
+                engine="openpyxl"
+            )
+        else:
+            raw_df = pd.read_csv(
+                io.BytesIO(data),
+                header=None,
+                engine="python",
+                sep=",",
+                encoding_errors="ignore"
+            )
 
-        if df.empty:
+        if raw_df.empty:
             return {"inserted": 0, "fetched": 0, "preview": []}
 
         # ---------- DATE ----------
-        date_str = extract_date_from_header(df)
+        date_str = extract_date_from_header(raw_df)
         sheet_date = (
             datetime.strptime(date_str, "%d-%m-%Y").date()
             if date_str else datetime.utcnow().date()
         )
 
         # ---------- HEADER ----------
-        header_idx = find_header_row_index(df)
+        header_idx = find_header_row_index(raw_df)
         if header_idx is None:
             raise HTTPException(400, "Dhan header row not found")
 
-        table = pd.read_excel(
-            io.BytesIO(data),
-            header=header_idx,
-            engine="openpyxl"
-        )
+        # ---------- FINAL TABLE ----------
+        if filename.endswith(".xlsx"):
+            table = pd.read_excel(
+                io.BytesIO(data),
+                header=header_idx,
+                engine="openpyxl"
+            )
+        else:
+            table = pd.read_csv(
+                io.BytesIO(data),
+                header=header_idx,
+                engine="python",
+                sep=",",
+                encoding_errors="ignore"
+            )
 
         table.columns = [str(c).strip() for c in table.columns]
 
@@ -176,7 +191,7 @@ async def import_csv_trades(
         fetched = 0
         preview = []
 
-        # ---------- PROCESS ROWS ----------
+        # ---------- PROCESS ----------
         for _, row in table.iterrows():
             fetched += 1
 
@@ -245,7 +260,7 @@ async def import_csv_trades(
                 "final_strategy": None,
                 "strategy_source": "AI",
                 "notes": None,
-                "raw": row.dropna().astype(str).to_dict(),
+                "raw": {k: clean_for_json(v) for k, v in row.items() if pd.notna(v)},
             }
 
             await create_trade(db, **payload)
@@ -268,7 +283,4 @@ async def import_csv_trades(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            500,
-            f"CSV import failed: {str(e)}"
-        )
+        raise HTTPException(500, f"CSV import failed: {str(e)}")
