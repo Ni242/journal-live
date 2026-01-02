@@ -1,11 +1,9 @@
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
-
 from app.deps import get_db
 from app.crud import create_trade
 from app.models import Trade
-from app.services.strategy_engine import detect_strategy
 
 import pandas as pd
 import io
@@ -13,64 +11,25 @@ import re
 from datetime import datetime, date
 from typing import Optional
 
+from app.services.strategy_engine import detect_strategy
+
 router = APIRouter(prefix="/import/csv", tags=["csv-import"])
 
-# ==================================================
-# SAFE LOADERS (NO PARSER CRASH)
-# ==================================================
+MONTHS = {
+    "JAN": "01", "FEB": "02", "MAR": "03", "APR": "04",
+    "MAY": "05", "JUN": "06", "JUL": "07", "AUG": "08",
+    "SEP": "09", "OCT": "10", "NOV": "11", "DEC": "12"
+}
 
-def safe_read_csv(data: bytes) -> pd.DataFrame:
-    return pd.read_csv(
-        io.BytesIO(data),
-        engine="python",
-        sep=None,
-        header=None,
-        encoding_errors="ignore",
-        on_bad_lines="skip",
-        quoting=3,
-    )
-
-def safe_read_excel(data: bytes) -> pd.DataFrame:
-    return pd.read_excel(
-        io.BytesIO(data),
-        header=None,
-        engine="openpyxl"
-    )
-
-# ==================================================
-# HEADER DETECTION — DHAN SAFE
-# ==================================================
-
-HEADER_KEYWORDS = [
-    "time",
-    "name",
-    "qty",
-    "quantity",
-    "price",
-    "avg",
-    "b/s",
-    "side",
-]
-
-def normalize(text: str) -> str:
-    return re.sub(r"\s+", "", text.lower())
-
-def find_header_row_index(df: pd.DataFrame) -> Optional[int]:
-    for i in range(min(100, len(df))):
-        cells = [normalize(str(c)) for c in df.iloc[i].tolist()]
-        hits = 0
-        for key in HEADER_KEYWORDS:
-            if any(key.replace("/", "") in c for c in cells):
-                hits += 1
-        if hits >= 4:   # 🔥 THIS IS THE MAGIC
-            return i
-    return None
-
-# ==================================================
+# =====================================================
 # HELPERS
-# ==================================================
+# =====================================================
 
-def safe_float(val, default=0.0) -> float:
+def is_excel_bytes(data: bytes) -> bool:
+    # XLSX files always start with PK\x03\x04
+    return data[:2] == b"PK"
+
+def safe_float(val, default=0.0):
     try:
         if val is None:
             return default
@@ -81,7 +40,7 @@ def safe_float(val, default=0.0) -> float:
     except Exception:
         return default
 
-def parse_qty(val) -> int:
+def parse_qty(val):
     try:
         if pd.isna(val):
             return 0
@@ -90,7 +49,7 @@ def parse_qty(val) -> int:
     except Exception:
         return 0
 
-def parse_side(val) -> Optional[str]:
+def parse_side(val):
     if pd.isna(val):
         return None
     v = str(val).upper()
@@ -100,77 +59,72 @@ def parse_side(val) -> Optional[str]:
         return "SELL"
     return None
 
-def parse_option_symbol(name: str, trade_date: date):
-    parts = str(name).split()
-    underlying = parts[0] if parts else name
+def find_dhan_header(df: pd.DataFrame) -> int:
+    """
+    Dhan header always contains these columns
+    """
+    REQUIRED = {"time", "name", "qty", "avg", "b/s"}
 
-    option_type = None
-    strike = None
+    for i in range(min(50, len(df))):
+        row = [str(x).lower() for x in df.iloc[i].tolist()]
+        if sum(any(k in cell for cell in row) for k in REQUIRED) >= 3:
+            return i
 
-    for p in parts:
-        if p.upper() in ("CE", "PE", "CALL", "PUT"):
-            option_type = p.upper()
-        if p.isdigit():
-            strike = int(p)
+    raise HTTPException(400, "Dhan header row not found")
 
-    return {
-        "symbol_text": name,
-        "underlying": underlying,
-        "strike": strike,
-        "option_type": option_type,
-    }
+def extract_date(df: pd.DataFrame) -> date:
+    pattern = re.compile(r"(\d{1,2}-\d{1,2}-\d{4})")
+    for i in range(min(20, len(df))):
+        for cell in df.iloc[i].astype(str):
+            m = pattern.search(cell)
+            if m:
+                return datetime.strptime(m.group(1), "%d-%m-%Y").date()
+    return datetime.utcnow().date()
 
-def clean(val):
-    if isinstance(val, (datetime, date)):
-        return val.isoformat()
-    return str(val)
-
-# ==================================================
+# =====================================================
 # ROUTE
-# ==================================================
+# =====================================================
 
 @router.post("/trades")
 async def import_csv_trades(
     file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
 ):
     data = await file.read()
-    name = file.filename.lower()
 
-    # ---------- RAW LOAD ----------
-    if name.endswith(".xlsx"):
-        raw_df = safe_read_excel(data)
-    elif name.endswith(".csv"):
-        raw_df = safe_read_csv(data)
-    else:
-        raise HTTPException(400, "Upload CSV or Excel file")
+    # 🔥 CRITICAL: detect real file type
+    try:
+        if is_excel_bytes(data):
+            raw_df = pd.read_excel(io.BytesIO(data), header=None, engine="openpyxl")
+            table_reader = lambda h: pd.read_excel(
+                io.BytesIO(data), header=h, engine="openpyxl"
+            )
+        else:
+            raw_df = pd.read_csv(
+                io.BytesIO(data),
+                header=None,
+                engine="python",
+                encoding_errors="ignore",
+                on_bad_lines="skip",
+            )
+            table_reader = lambda h: pd.read_csv(
+                io.BytesIO(data),
+                header=h,
+                engine="python",
+                encoding_errors="ignore",
+                on_bad_lines="skip",
+            )
+    except Exception as e:
+        raise HTTPException(400, f"Failed to read file: {e}")
 
     if raw_df.empty:
-        raise HTTPException(400, "File is empty")
+        return {"inserted": 0, "fetched": 0, "preview": []}
 
-    # ---------- FIND HEADER ----------
-    header_idx = find_header_row_index(raw_df)
-    if header_idx is None:
-        raise HTTPException(400, "Dhan header row not found")
+    sheet_date = extract_date(raw_df)
+    header_idx = find_dhan_header(raw_df)
 
-    # ---------- FINAL TABLE ----------
-    if name.endswith(".xlsx"):
-        table = pd.read_excel(
-            io.BytesIO(data),
-            header=header_idx,
-            engine="openpyxl"
-        )
-    else:
-        table = pd.read_csv(
-            io.BytesIO(data),
-            header=header_idx,
-            engine="python",
-            sep=None,
-            encoding_errors="ignore",
-            on_bad_lines="skip",
-        )
-
-    table.columns = [normalize(c) for c in table.columns]
+    table = table_reader(header_idx)
+    table.columns = [str(c).strip() for c in table.columns]
 
     inserted = 0
     fetched = 0
@@ -179,30 +133,29 @@ async def import_csv_trades(
     for _, row in table.iterrows():
         fetched += 1
 
-        name = row.get("name")
+        name = row.get("Name")
         if pd.isna(name):
             continue
 
-        side = parse_side(row.get("b/s") or row.get("side"))
-        if side is None:
+        side = parse_side(row.get("B/S"))
+        if not side:
             continue
 
-        qty = parse_qty(row.get("qty/lot") or row.get("qty") or row.get("quantity"))
-        price = safe_float(row.get("avgprice") or row.get("price"))
+        qty = parse_qty(row.get("Qty/Lot"))
+        price = safe_float(row.get("Avg Price"))
 
-        trade_time = datetime.utcnow()
-        if "time" in row and not pd.isna(row["time"]):
+        trade_time = datetime.combine(sheet_date, datetime.min.time())
+        if "Time" in row and not pd.isna(row["Time"]):
             try:
-                trade_time = pd.to_datetime(row["time"]).to_pydatetime()
+                t = pd.to_datetime(row["Time"])
+                trade_time = datetime.combine(sheet_date, t.time())
             except Exception:
                 pass
 
-        parsed = parse_option_symbol(str(name), trade_time.date())
-
-        # ---------- DEDUP ----------
+        # Dedup
         q = select(Trade).where(
             and_(
-                Trade.symbol == parsed["symbol_text"],
+                Trade.symbol == name,
                 Trade.trade_time == trade_time,
                 Trade.side == side,
                 Trade.quantity == qty,
@@ -212,20 +165,20 @@ async def import_csv_trades(
         if (await db.execute(q)).scalar_one_or_none():
             continue
 
-        strategy = detect_strategy(
-            Trade(
-                symbol=parsed["symbol_text"],
-                side=side,
-                quantity=qty,
-                price=price,
-                trade_time=trade_time,
-            ),
-            context={"option_type": parsed.get("option_type")}
+        temp_trade = Trade(
+            symbol=name,
+            side=side,
+            quantity=qty,
+            price=price,
+            trade_time=trade_time,
         )
+
+        strategy = detect_strategy(temp_trade)
 
         await create_trade(
             db,
-            symbol=parsed["symbol_text"],
+            dh_order_id=None,
+            symbol=name,
             side=side,
             quantity=qty,
             price=price,
@@ -233,20 +186,23 @@ async def import_csv_trades(
             fees=0,
             suggested_strategy=strategy["strategy"],
             strategy_confidence=strategy["confidence"],
+            final_strategy=None,
             strategy_source="AI",
-            raw={k: clean(v) for k, v in row.items() if pd.notna(v)},
+            notes=None,
+            raw=row.dropna().to_dict(),
         )
 
         inserted += 1
         preview.append({
-            "symbol": parsed["symbol_text"],
+            "symbol": name,
             "side": side,
             "qty": qty,
             "price": price,
+            "strategy": strategy["strategy"],
         })
 
     return {
         "inserted": inserted,
         "fetched": fetched,
-        "preview": preview[:20],
+        "preview": preview[:50],
     }
