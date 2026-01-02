@@ -24,6 +24,32 @@ MONTHS = {
 }
 
 # ==================================================
+# SAFE LOADERS (MOST IMPORTANT PART)
+# ==================================================
+
+def safe_read_csv(data: bytes) -> pd.DataFrame:
+    """
+    Bulletproof CSV reader for broker files (Dhan, Zerodha, etc.)
+    """
+    return pd.read_csv(
+        io.BytesIO(data),
+        engine="python",           # critical
+        sep=None,                  # auto-detect delimiter
+        header=None,
+        encoding_errors="ignore",
+        on_bad_lines="skip",       # skip broken rows
+        quoting=3,                 # csv.QUOTE_NONE
+    )
+
+
+def safe_read_excel(data: bytes) -> pd.DataFrame:
+    return pd.read_excel(
+        io.BytesIO(data),
+        header=None,
+        engine="openpyxl"
+    )
+
+# ==================================================
 # HELPERS
 # ==================================================
 
@@ -62,7 +88,7 @@ def parse_side(val) -> Optional[str]:
 
 def extract_date_from_header(df: pd.DataFrame) -> Optional[str]:
     pattern = re.compile(r"(\d{1,2}-\d{1,2}-\d{4})")
-    for i in range(min(25, len(df))):
+    for i in range(min(30, len(df))):
         for cell in df.iloc[i].astype(str):
             m = pattern.search(cell)
             if m:
@@ -71,9 +97,9 @@ def extract_date_from_header(df: pd.DataFrame) -> Optional[str]:
 
 
 def find_header_row_index(df: pd.DataFrame) -> Optional[int]:
-    for i in range(min(50, len(df))):
+    for i in range(min(60, len(df))):
         row = [str(x).lower() for x in df.iloc[i].tolist()]
-        if "time" in row and ("qty/lot" in row or "qty" in row):
+        if "time" in row and any("qty" in c for c in row):
             return i
     return None
 
@@ -119,7 +145,7 @@ def clean_for_json(val):
     return str(val)
 
 # ==================================================
-# CSV / EXCEL IMPORT ROUTE
+# IMPORT ROUTE
 # ==================================================
 
 @router.post("/trades")
@@ -128,31 +154,16 @@ async def import_csv_trades(
     db: AsyncSession = Depends(get_db)
 ):
     filename = file.filename.lower()
-
-    if not (filename.endswith(".csv") or filename.endswith(".xlsx")):
-        raise HTTPException(
-            400,
-            "Please upload a Dhan Executed Orders CSV or Excel (.xlsx) file"
-        )
+    data = await file.read()
 
     try:
-        data = await file.read()
-
-        # ---------- SAFE RAW LOAD ----------
+        # ---------- RAW LOAD ----------
         if filename.endswith(".xlsx"):
-            raw_df = pd.read_excel(
-                io.BytesIO(data),
-                header=None,
-                engine="openpyxl"
-            )
+            raw_df = safe_read_excel(data)
+        elif filename.endswith(".csv"):
+            raw_df = safe_read_csv(data)
         else:
-            raw_df = pd.read_csv(
-                io.BytesIO(data),
-                header=None,
-                engine="python",
-                sep=",",
-                encoding_errors="ignore"
-            )
+            raise HTTPException(400, "Upload CSV or Excel file")
 
         if raw_df.empty:
             return {"inserted": 0, "fetched": 0, "preview": []}
@@ -181,8 +192,9 @@ async def import_csv_trades(
                 io.BytesIO(data),
                 header=header_idx,
                 engine="python",
-                sep=",",
-                encoding_errors="ignore"
+                sep=None,
+                encoding_errors="ignore",
+                on_bad_lines="skip",
             )
 
         table.columns = [str(c).strip() for c in table.columns]
